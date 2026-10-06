@@ -1,0 +1,23 @@
+{
+  "name": "TheSlap",
+  "short_name": "TheSlap",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#14061f",
+  "theme_color": "#14061f",
+  "icons": [
+    {
+      "src": "logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
