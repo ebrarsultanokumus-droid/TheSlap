@@ -581,6 +581,13 @@ button.okc.live{cursor:pointer;box-shadow:0 0 0 2px var(--lime),0 0 18px rgba(18
 .qrow button{border:1.5px solid var(--cb);background:var(--inp);color:var(--text);border-radius:99px;padding:4px 10px;font:800 14px var(--fb);cursor:pointer}
 .qrow button:active{transform:scale(.94)}
 
+/* ===== v10: Antworten auf Kommentare ===== */
+.cm-rb{border:0;background:none;color:var(--cyan);font:800 12.5px var(--fb);padding:2px 0;margin-top:2px;cursor:pointer}
+.cm-replies{margin:-2px 0 6px 40px;padding-left:10px;border-left:2px solid var(--cb)}
+.cm.rep .av{--s:28px}
+.cm-reply{align-items:center;justify-content:space-between;gap:8px;padding:6px 10px;margin:6px 0 0;border-radius:12px;background:rgba(0,229,255,.12);border:1px solid var(--cyan);font-weight:700;font-size:13.5px}
+.cm-reply button{border:0;background:none;color:var(--text);font-size:16px;cursor:pointer}
+.sheet>.x{z-index:20}
 </style>
 </head>
 <body>
@@ -1517,7 +1524,7 @@ const GAMES = {
   okey: { name: 'Okey', icon: '🀄', color: '#ff8a00', blurb: 'Online mit 2–4 Spielern – das türkische Steinspiel', online: true }
 };
 const okColor = c => /^#[0-9a-f]{6}$/i.test(c || '') ? c : '#ff2bd6';
-const DEF = { maxVideoMb: 25, tagline: "What's HOT @ H. Hijabis", logoId: '', registration: 'open', introOn: true, announcement: '', maxLen: 1500, features: { comments: true, reactions: true, video: true, news: true, games: true, pacman: true, snake: true, runner: true, battleship: true, okey: true } };
+const DEF = { pushUrl: '', maxVideoMb: 25, tagline: "What's HOT @ H. Hijabis", logoId: '', registration: 'open', introOn: true, announcement: '', maxLen: 1500, features: { comments: true, reactions: true, video: true, news: true, games: true, pacman: true, snake: true, runner: true, battleship: true, okey: true } };
 const mergeCfg = d => { const c = JSON.parse(JSON.stringify(DEF)); if (d) for (const k in d) { if (k === 'features' && d.features) Object.assign(c.features, d.features); else if (k !== 'id') c[k] = d[k]; } return c; };
 
 const S = {
@@ -1736,12 +1743,59 @@ function markPostsSeen() {
   updateAppBadge();
 }
 function updateAppBadge() {
+  if (!document.hidden && navigator.serviceWorker && navigator.serviceWorker.controller) try { navigator.serviceWorker.controller.postMessage({ type: 'clearBadge' }); } catch (_) { /* egal */ }
   if (!navigator.setAppBadge) return;
   const n = S.uid && me() ? unreadPosts() + bellCount() + (FT('games') ? gamesBadge() : 0) : 0;
   try { const p = n ? navigator.setAppBadge(Math.min(n, 99)) : navigator.clearAppBadge(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* egal */ }
 }
 let swReg = null;
+const VAPID_PUB = 'BLrFlpmensCJATIRcev0f_MaTXOj4wOt9BZpiQ0BvWm1dChKYHzxMdumM_DKEIGl2fyOXhv37PNbjHGTO9RTk4k';
+const b64uBytes = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return Uint8Array.from(atob(s), c => c.charCodeAt(0)); };
+const pushReady = () => 'serviceWorker' in navigator && typeof PushManager !== 'undefined' && typeof Notification !== 'undefined' && Notification.permission === 'granted' && /^https:\/\//.test(S.cfg.pushUrl || '');
+async function pushSubscribe() {
+  try {
+    if (!pushReady() || !S.uid) return false;
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (sub && sub.options && sub.options.applicationServerKey) { const k = new Uint8Array(sub.options.applicationServerKey), v = b64uBytes(VAPID_PUB); if (k.length !== v.length || k.some((x, i) => x !== v[i])) { await sub.unsubscribe(); sub = null; } }
+    if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uBytes(VAPID_PUB) });
+    const j = sub.toJSON(), ref = col('push').doc(S.uid), d = await ref.get();
+    const subs = ((d.exists && d.data().subs) || []).filter(x => x.endpoint !== j.endpoint);
+    subs.push({ endpoint: j.endpoint, keys: j.keys, at: Date.now() });
+    await ref.set({ uid: S.uid, subs: subs.slice(-5) });
+    S.pushOn = true; return true;
+  } catch (e) { console.warn('Push-Anmeldung', e); return false; }
+}
+async function pushUnsubscribe() {
+  try {
+    if (!('serviceWorker' in navigator)) return;
+    const reg = await navigator.serviceWorker.getRegistration(); const sub = reg && await reg.pushManager.getSubscription(); if (!sub) return;
+    const ref = col('push').doc(S.uid), d = await ref.get();
+    if (d.exists) await ref.set({ uid: S.uid, subs: (d.data().subs || []).filter(x => x.endpoint !== sub.endpoint) });
+  } catch (_) { /* egal */ }
+}
+async function sendPush(uids, msg, self) {
+  const url = S.cfg.pushUrl; if (!/^https:\/\//.test(url || '')) return;
+  uids = [...new Set(uids || [])].filter(u => u && (self || u !== S.uid) && S.users[u] && S.users[u].status === 'active');
+  if (!uids.length) return;
+  const subs = [], owners = [];
+  await Promise.all(uids.map(async u => { try { const d = await col('push').doc(u).get(); if (d.exists) (d.data().subs || []).forEach(x => { subs.push({ endpoint: x.endpoint, keys: x.keys }); owners.push(u); }); } catch (_) { /* egal */ } }));
+  if (!subs.length) return 0;
+  try {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ subs, msg }) }), j = await r.json();
+    (j.results || []).forEach((st, i) => { if (st === 404 || st === 410) { const u = owners[i], ep = subs[i].endpoint, ref = col('push').doc(u); ref.get().then(d => { if (d.exists) ref.set({ uid: u, subs: (d.data().subs || []).filter(x => x.endpoint !== ep) }); }).catch(() => {}); } });
+    return (j.results || []).filter(x => x >= 200 && x < 300).length;
+  } catch (e) { console.warn('Push senden', e); return -1; }
+}
+const myName = () => { const m = me(); return m ? (m.name || m.username) : 'Jemand'; };
+function openDeep(u) {
+  let m = /^#post=([\w-]+)$/.exec(u || '');
+  if (m) { if (S.tab !== 'home') go('home'); if (S.postMap[m[1]]) openPost(m[1]); return; }
+  m = /^#game=(\w+):([\w-]+)$/.exec(u || '');
+  if (m && GAMES[m[1]]) { S.openMatch = m[2]; go('game', m[1]); }
+}
 function sysNote(title, body, tag, onclick) {
+  if (S.pushOn) return;
   if (!document.hidden || typeof Notification !== 'function' || Notification.permission !== 'granted') return;
   const opts = { body, icon: APP_ICON, badge: APP_ICON, tag };
   try { const n = new Notification(title, opts); n.onclick = () => { window.focus(); if (onclick) onclick(); n.close(); }; }
@@ -1756,16 +1810,17 @@ function announcePost(p) {
 }
 function announceComment(c) {
   const u = S.users[c.uid], name = u ? (u.name || u.username) : 'Jemand';
-  toast('📣 ' + name + ' hat dich in einem Kommentar markiert'); SND.play('notify');
-  sysNote('TheSlap · ' + name, 'Hat dich markiert: ' + String(c.text || '').slice(0, 80), 'cm-' + c.id, () => openPost(c.postId));
+  const rep = c.replyUid === S.uid;
+  toast(rep ? '↩️ ' + name + ' hat dir geantwortet' : '📣 ' + name + ' hat dich in einem Kommentar markiert'); SND.play('notify');
+  sysNote('TheSlap · ' + name, (rep ? 'Antwort: ' : 'Hat dich markiert: ') + String(c.text || '').slice(0, 80), 'cm-' + c.id, () => openPost(c.postId));
 }
 const notifState = () => typeof Notification === 'undefined' ? 'none' : Notification.permission;
 const standalone = () => window.navigator.standalone === true || !!(window.matchMedia && matchMedia('(display-mode: standalone)').matches);
 function notifBlock() {
   const st = notifState();
-  let h = '<div class="card"><b style="font:800 20px var(--fh)">🔔 Benachrichtigungen</b><p class="muted" style="font-weight:700;font-size:14px;margin:6px 0 10px;line-height:1.4">Wenn jemand, dem du folgst, etwas postet oder dich jemand mit @ markiert, bekommst du eine Mitteilung' + (navigator.setAppBadge ? ' und eine Zahl am App-Symbol' : '') + '. Eine Meldung auf dem Bildschirm kommt, solange TheSlap geöffnet ist oder im Hintergrund läuft.</p>';
+  let h = '<div class="card"><b style="font:800 20px var(--fh)">🔔 Benachrichtigungen</b><p class="muted" style="font-weight:700;font-size:14px;margin:6px 0 10px;line-height:1.4">Du bekommst eine Mitteilung, wenn jemand, dem du folgst, postet, dich jemand markiert, auf deinen Kommentar antwortet, deinen Post kommentiert – und wenn du in einem Spiel dran bist oder eingeladen wirst.' + (S.cfg.pushUrl ? ' Das klappt auch, wenn TheSlap geschlossen ist.' : '') + '</p>';
   if (st === 'none') h += '<div class="note">Auf diesem Gerät sind Browser-Benachrichtigungen nicht verfügbar.' + (standalone() ? '' : ' iPhone: Öffne TheSlap in Safari, tippe auf Teilen → „Zum Home-Bildschirm“ und starte die App von dort.') + '</div>';
-  else if (st === 'granted') h += '<div class="note">✅ Benachrichtigungen sind aktiv.</div>';
+  else if (st === 'granted') h += '<div class="note">✅ Benachrichtigungen sind aktiv' + (S.cfg.pushUrl ? (typeof PushManager !== 'undefined' ? ' – auch bei geschlossener App 📲' : '. Für Mitteilungen bei geschlossener App: iPhone ab iOS 16.4 und TheSlap vom Home-Bildschirm starten.') : ' (solange TheSlap offen ist).') + '</div>' + (S.cfg.pushUrl ? '<button class="btn sm cyan" data-a="pushtest">📲 Test-Mitteilung an mich</button>' : '');
   else if (st === 'denied') h += '<div class="note">❌ Benachrichtigungen sind blockiert. Erlaube sie in den Einstellungen deines Browsers bzw. unter iOS → Einstellungen → Mitteilungen → TheSlap.</div>';
   else h += '<button class="btn cyan" data-a="notifon">🔔 Benachrichtigungen aktivieren</button>';
   return h + '</div>';
@@ -1860,6 +1915,7 @@ async function verifySession() {
   } catch (e) { console.error(e); return false; }
 }
 async function logout() {
+  await pushUnsubscribe();
   try { const cs = await col('creds').doc(S.uid).get(); if (cs.exists) await col('creds').doc(S.uid).update({ sessions: (cs.data().sessions || []).filter(x => x !== S.sessHash) }); } catch (_) { /* egal */ }
   lsSet(null); location.reload();
 }
@@ -1916,7 +1972,7 @@ function startData() {
   });
   mk('comments', col('comments').orderBy('createdAt', 'asc').limit(1000), (a, fc) => {
     const prev = S.knownCms; S.comments = a;
-    if (!fc) { if (prev && S.uid) { reindex(); a.filter(c => !prev.has(c.id) && mentionsMe(c)).forEach(announceComment); } S.knownCms = new Set(a.map(c => c.id)); }
+    if (!fc) { if (prev && S.uid) { reindex(); a.filter(c => !prev.has(c.id) && c.uid !== S.uid && (c.replyUid === S.uid || mentionsMe(c))).forEach(announceComment); } S.knownCms = new Set(a.map(c => c.id)); }
   });
   mk('matches', col('matches').orderBy('updatedAt', 'desc').limit(150), (a, fc) => { S.matches = a; if (!fc && S.uid && S.loaded.users) S.matchKeys = matchAlerts(S.matchKeys); });
   mk('reacts', col('reacts').limit(2000), a => { S.reacts = a; });
@@ -1931,6 +1987,10 @@ async function saveCfg(patch) {
 async function createPost(d) {
   const id = 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
   await col('posts').doc(id).set({ type: 'post', uid: S.uid, createdAt: Date.now(), title: d.title, text: d.text, mood: d.mood, media: d.media, mentions: mentionsIn(d.title + ' ' + d.text) });
+  const men = mentionsIn(d.title + ' ' + d.text), body = String(d.title || d.text || (d.media && d.media.length ? '📷 Neues Bild' : '')).replace(/\s+/g, ' ').slice(0, 120), url = '#post=' + id;
+  sendPush(men, { title: '📣 ' + myName() + ' hat dich markiert', body, url, tag: 'post-' + id });
+  sendPush(followersOf(S.uid).map(u => u.uid).filter(u => !men.includes(u)), { title: '✨ ' + myName() + ' hat gepostet', body, url, tag: 'post-' + id });
+  return id;
 }
 async function deletePost(id) {
   const p = S.postMap[id]; if (!p) return;
@@ -2038,6 +2098,8 @@ function render(force) {
   if (!S.boomDone && isBday(m)) { S.boomDone = true; setTimeout(() => birthdayBoom(m), Math.max(900, splashEnd - Date.now() + 600)); }
   paintChrome(); paintLogos();
   if (S.mustChange && !S.sheet) openPwSheet(true);
+  if (!S.pushTried && S.cfgLoaded) { S.pushTried = true; pushSubscribe(); }
+  if (S.deep && S.loaded.posts && S.loaded.matches) { const d = S.deep; S.deep = null; setTimeout(() => openDeep(d), 60); }
   if (S.tab === 'game' && S.gameLive) { const lb = $('#lb'), lh = lbHtml(S.gameId); if (lb && lb.dataset.h !== lh) { lb.innerHTML = lh; lb.dataset.h = lh; } if (S.gameInst && S.gameInst.paint) S.gameInst.paint(); return; }
   if (S.tab === 'settings' && !isAdmin()) S.setTab = 'konto';
   if (S.tab === 'games' && !FT('games')) S.tab = 'home';
@@ -2383,15 +2445,38 @@ async function sendPost() {
 }
 
 /* ---------- Post-Detail ---------- */
+function cmOne(c, isReply) {
+  const u = S.users[c.uid], to = isReply && c.replyUid && S.users[c.replyUid];
+  return '<div class="cm' + (isReply ? ' rep' : '') + '"><button class="avb" data-a="profile" data-id="' + esc(u.uid) + '">' + av(u, isReply ? 28 : 34) + '</button><div class="cb"><div class="cn">' + nameHtml(u) + (to && c.replyUid !== c.uid ? ' <span class="muted" style="font:800 12px var(--fb)">↪ ' + esc(to.name || to.username) + '</span>' : '') + ' <span class="muted" style="font:700 12px var(--fb)">' + ago(c.createdAt) + '</span></div><div class="ct">' + fmt(c.text) + '</div>' +
+    (FT('comments') && !S.readonly ? '<button class="cm-rb" data-a="replycm" data-id="' + esc(c.id) + '">↩️ Antworten</button>' : '') + '</div>' +
+    (c.uid === S.uid || isMod() ? '<button class="ib sm" data-a="delcm" data-id="' + esc(c.id) + '" aria-label="Löschen">🗑️</button>' : '') + '</div>';
+}
 function cmList(pid) {
   const l = S.I.cm[pid] || [];
   if (!l.length) return '<div class="muted center" style="padding:14px;font-weight:700">Noch keine Kommentare – schreib den ersten! 💬</div>';
-  return l.map(c => { const u = S.users[c.uid]; return '<div class="cm"><button class="avb" data-a="profile" data-id="' + esc(u.uid) + '">' + av(u, 34) + '</button><div class="cb"><div class="cn">' + nameHtml(u) + ' <span class="muted" style="font:700 12px var(--fb)">' + ago(c.createdAt) + '</span></div><div class="ct">' + fmt(c.text) + '</div></div>' + (c.uid === S.uid || isMod() ? '<button class="ib sm" data-a="delcm" data-id="' + esc(c.id) + '" aria-label="Löschen">🗑️</button>' : '') + '</div>'; }).join('');
+  const ids = new Set(l.map(c => c.id)), kids = {};
+  l.forEach(c => { if (c.replyTo && ids.has(c.replyTo)) (kids[c.replyTo] = kids[c.replyTo] || []).push(c); });
+  return l.filter(c => !(c.replyTo && ids.has(c.replyTo))).map(c => cmOne(c) + (kids[c.id] ? '<div class="cm-replies">' + kids[c.id].map(k => cmOne(k, true)).join('') + '</div>' : '')).join('');
+}
+function startReply(cid) {
+  const c = S.comments.find(x => x.id === cid); if (!c) return;
+  const u = S.users[c.uid]; S.reply = { parent: c.replyTo || c.id, to: c.uid };
+  paintReply();
+  const inp = $('#cm-text'); if (!inp) return;
+  if (u && c.uid !== S.uid && !new RegExp('@' + u.username + '\\b', 'i').test(inp.value)) inp.value = '@' + u.username + ' ' + inp.value.replace(/^@\w+\s*/, '');
+  inp.focus(); const n = inp.value.length; inp.setSelectionRange(n, n);
+}
+function paintReply() {
+  const el = $('#cm-reply'); if (!el) return;
+  const u = S.reply && S.users[S.reply.to];
+  el.innerHTML = u ? '<span>↩️ Antwort an <b>' + esc(u.name || u.username) + '</b></span><button type="button" data-a="replyx" aria-label="Antworten abbrechen">✕</button>' : '';
+  el.style.display = u ? 'flex' : 'none';
+  const inp = $('#cm-text'); if (inp) inp.placeholder = u ? 'Deine Antwort …' : 'Schreib einen Kommentar …';
 }
 function openPost(id) {
   if (!S.postMap[id]) return;
-  openSheet('<div id="pd-card"></div>' + (FT('comments') ? '<label class="lb">Kommentare</label><div id="cm-list"></div><div class="cm-in"><input class="inp" id="cm-text" maxlength="400" placeholder="Schreib einen Kommentar …" autocomplete="off"><button class="btn sm" data-a="sendcm">Senden</button></div>' : '<div id="cm-list"></div>'));
-  S.sheet = { type: 'post', id }; paintPostSheet();
+  openSheet('<div id="pd-card"></div>' + (FT('comments') ? '<label class="lb">Kommentare</label><div id="cm-list"></div><div id="cm-reply" class="cm-reply" style="display:none"></div><div class="cm-in"><input class="inp" id="cm-text" maxlength="400" placeholder="Schreib einen Kommentar …" autocomplete="off"><button class="btn sm" data-a="sendcm">Senden</button></div>' : '<div id="cm-list"></div>'));
+  S.sheet = { type: 'post', id }; S.reply = null; paintPostSheet();
 }
 function paintPostSheet() {
   const s = S.sheet; if (!s || s.type !== 'post') return;
@@ -2406,7 +2491,14 @@ async function sendComment() {
   if (S.readonly) return toast('Du hast nur Leserechte.');
   inp.value = '';
   const id = 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  if (!(await w(() => col('comments').doc(id).set({ postId: S.sheet.id, uid: S.uid, text, createdAt: Date.now(), mentions: mentionsIn(text) })))) inp.value = text;
+  const rp = S.reply, pid = S.sheet.id, d = { postId: pid, uid: S.uid, text, createdAt: Date.now(), mentions: mentionsIn(text) };
+  if (rp && S.comments.some(c => c.id === rp.parent)) { d.replyTo = rp.parent; d.replyUid = rp.to; }
+  if (!(await w(() => col('comments').doc(id).set(d)))) { inp.value = text; return; }
+  S.reply = null; paintReply(); SND.play('msg');
+  const post = S.postMap[pid], men = d.mentions, body = text.slice(0, 140), url = '#post=' + pid, rep = d.replyUid && d.replyUid !== S.uid ? d.replyUid : null;
+  if (rep) sendPush([rep], { title: '↩️ ' + myName() + ' hat dir geantwortet', body, url, tag: 'cm-' + pid });
+  sendPush(men.filter(u => u !== rep), { title: '📣 ' + myName() + ' hat dich markiert', body, url, tag: 'cm-' + pid });
+  if (post && post.uid !== S.uid && post.uid !== rep && !men.includes(post.uid)) sendPush([post.uid], { title: '💬 ' + myName() + ' hat deinen Post kommentiert', body, url, tag: 'cm-' + pid });
 }
 
 /* ---------- Mitteilungen ---------- */
@@ -2414,13 +2506,13 @@ function notes() {
   if (!S.uid) return [];
   const my = new Set(S.posts.filter(p => p.uid === S.uid && p.type === 'post').map(p => p.id)), out = [];
   for (const r of S.reacts) { if (r.uid === S.uid || !my.has(r.postId)) continue; if (r.emoji) out.push({ t: r.at, uid: r.uid, k: 'emo', e: r.emoji, post: r.postId }); }
-  for (const c of S.comments) { if (c.uid === S.uid) continue; if (mentionsMe(c)) out.push({ t: c.createdAt, uid: c.uid, k: 'menc', post: c.postId, text: c.text }); else if (my.has(c.postId)) out.push({ t: c.createdAt, uid: c.uid, k: 'cm', post: c.postId, text: c.text }); }
+  for (const c of S.comments) { if (c.uid === S.uid) continue; if (c.replyUid === S.uid) out.push({ t: c.createdAt, uid: c.uid, k: 'rep', post: c.postId, text: c.text }); else if (mentionsMe(c)) out.push({ t: c.createdAt, uid: c.uid, k: 'menc', post: c.postId, text: c.text }); else if (my.has(c.postId)) out.push({ t: c.createdAt, uid: c.uid, k: 'cm', post: c.postId, text: c.text }); }
   for (const p of S.posts) { if (p.type !== 'post' || p.uid === S.uid) continue; if (mentionsMe(p)) out.push({ t: p.createdAt, uid: p.uid, k: 'men', post: p.id, text: String(p.title || p.text || '') }); else if (follows(p.uid)) out.push({ t: p.createdAt, uid: p.uid, k: 'post', post: p.id, text: String(p.title || p.text || '') }); }
   return out.filter(n => visible(n.uid)).sort((a, b) => b.t - a.t).slice(0, 40);
 }
 function openNotes() {
   const list = notes(), seen = (me().seenAt) || 0;
-  const txt = n => n.k === 'men' ? 'hat dich in einem Post markiert 📣' : n.k === 'menc' ? 'hat dich markiert: „' + n.text.slice(0, 60) + '“' : n.k === 'post' ? 'hat gepostet' + (n.text ? ': „' + n.text.slice(0, 50) + '“' : '') : n.k === 'like' ? 'hat deinen Post geliked ❤️' : n.k === 'emo' ? 'hat mit ' + n.e + ' reagiert' : n.k === 'rp' ? 'hat deinen Post repostet 🔁' : 'hat kommentiert: „' + n.text.slice(0, 60) + '“';
+  const txt = n => n.k === 'rep' ? 'hat dir geantwortet: „' + n.text.slice(0, 60) + '“' : n.k === 'men' ? 'hat dich in einem Post markiert 📣' : n.k === 'menc' ? 'hat dich markiert: „' + n.text.slice(0, 60) + '“' : n.k === 'post' ? 'hat gepostet' + (n.text ? ': „' + n.text.slice(0, 50) + '“' : '') : n.k === 'like' ? 'hat deinen Post geliked ❤️' : n.k === 'emo' ? 'hat mit ' + n.e + ' reagiert' : n.k === 'rp' ? 'hat deinen Post repostet 🔁' : 'hat kommentiert: „' + n.text.slice(0, 60) + '“';
   openSheet('<h3 class="sh-t">Mitteilungen 🔔</h3>' + (list.length ? list.map(n => { const u = S.users[n.uid]; return '<button class="nrow ' + (n.t > seen ? 'new' : '') + '" data-a="open" data-id="' + esc(n.post) + '">' + av(u, 38) + '<div><b>' + esc(u.name || u.username) + '</b> ' + esc(txt(n)) + '<small>' + ago(n.t) + '</small></div></button>'; }).join('') : '<div class="empty muted"><span class="big">🔕</span>Noch nichts Neues.</div>'));
   S.sheet = { type: 'notes' };
   S.seenPostsLocal = Date.now(); w(() => col('members').doc(S.uid).update({ seenAt: Date.now(), seenPostsAt: Date.now() }));
@@ -2638,7 +2730,7 @@ function OnlineGame(host, gid) {
   async function sendChat(text) {
     text = String(text || '').trim().slice(0, 200); if (!text || !L.mid) return;
     const r = await T(x => { if (!x) return; x.chat = (x.chat || []).concat([{ u: S.uid, t: text, at: Date.now() }]).slice(-60); x.updatedAt = Date.now(); return x; });
-    if (r) SND.play('tap');
+    if (r) { SND.play('tap'); sendPush(r.players.filter(u => u !== S.uid), { title: '💬 ' + myName() + ' · ' + g.name, body: text, url: '#game=' + gid + ':' + L.mid, tag: 'chat-' + L.mid }); }
   }
   /* ---------- Sounds bei Zügen der anderen ---------- */
   function sounds(m) {
@@ -2735,14 +2827,14 @@ function OnlineGame(host, gid) {
     const canDraw = turn && st.phase === 'draw', canDisc = turn && st.phase === 'discard';
     let h = '<div class="okp">' + m.players.map((u, i) => pchip(u, m.turn === i && !done, '<em>' + ((st.racks[u] || []).filter(v => v !== null).length) + '</em>')).join('') + '</div>';
     if (done) h += '<div class="mbanner ' + (m.winner === S.uid ? 'win' : 'lose') + '">' + (m.winner === S.uid ? '🏆 Du hast gewonnen!' : m.winner ? '🎉 ' + esc(uname(m.winner)) + ' hat gewonnen!' : '🤝 Unentschieden') + (m.msg ? '<small>' + esc(m.msg) + '</small>' : '') + '</div>';
-    else h += '<div class="mbanner ' + (turn ? 'turn' : '') + '">' + (turn ? (canDraw ? '👉 Zieh einen Stein: Stapel oder ' + esc(uname(prevU)) + 's Abwurf' : '👉 Wähl einen Stein und wirf ihn ab – oder beende mit „Fertig“') : '⏳ ' + esc(uname(m.players[m.turn])) + ' ist dran …') + (m.msg ? '<small>' + esc(m.msg) + '</small>' : '') + '</div>';
+    else h += '<div class="mbanner ' + (turn ? 'turn' : '') + '">' + (turn ? '👉 Du bist dran!' : '⏳ ' + esc(uname(m.players[m.turn])) + ' ist dran …') + '</div>';
     h += '<div class="oktable"><div class="okc"><small>Anzeiger</small>' + tileH(st.ind, st.ind) + '</div><div class="okc"><small>Okey</small><span class="tile jk" style="color:' + OK_COL[J.c] + '">' + J.n + '</span></div>' +
       '<button class="okc deck' + (canDraw ? ' live' : '') + '"' + (canDraw ? ' data-a="mg" data-op="draw"' : ' disabled') + '><small>Stapel</small><span class="tile back">' + st.deck.length + '</span></button>' +
       '<button class="okc' + (canDraw && prevPile.length ? ' live' : '') + '"' + (canDraw && prevPile.length ? ' data-a="mg" data-op="take"' : ' disabled') + '><small>von ' + esc(uname(prevU)) + '</small>' + (prevPile.length ? tileH(prevPile[prevPile.length - 1], st.ind) : '<span class="tile empty"></span>') + '</button></div>';
-    const others = m.players.filter(u => u !== prevU && (st.disc[u] || []).length);
-    if (others.length) h += '<div class="okdisc">' + others.map(u => '<span>' + (u === S.uid ? 'Dein Abwurf' : esc(uname(u))) + ': ' + tileH(st.disc[u][st.disc[u].length - 1], st.ind, 'sm') + '</span>').join('') + '</div>';
+    const others = m.players.filter(u => u !== prevU && u !== S.uid && (st.disc[u] || []).length);
+    if (others.length) h += '<div class="okdisc">' + others.map(u => '<span>' + esc(uname(u)) + ' ' + tileH(st.disc[u][st.disc[u].length - 1], st.ind, 'sm') + '</span>').join('') + '</div>';
     if (done && m.winner && m.winner !== S.uid && st.racks[m.winner]) h += '<div class="bst" style="margin-top:10px">Blatt von ' + esc(uname(m.winner)) + '</div><div class="rack ro">' + st.racks[m.winner].map(v => '<span class="slot">' + (v === null ? '' : tileH(v, st.ind)) + '</span>').join('') + '</div>';
-    h += '<div class="bst" style="margin-top:10px">Dein Brett <span class="muted">· tippen = auswählen, nochmal tippen = verschieben</span></div><div class="rack">' + rack.map((v, i) => '<button class="slot' + (L.sel === i ? ' sel' : '') + '" data-a="mg" data-op="slot" data-i="' + i + '">' + (v === null ? '' : tileH(v, st.ind)) + '</button>').join('') + '</div>';
+    h += '<div class="rack" style="margin-top:12px">' + rack.map((v, i) => '<button class="slot' + (L.sel === i ? ' sel' : '') + '" data-a="mg" data-op="slot" data-i="' + i + '">' + (v === null ? '' : tileH(v, st.ind)) + '</button>').join('') + '</div>';
     h += '<div class="row wrap g8" style="margin-top:10px">' + btn('sort', '🎨 Nach Farbe', 'sm cyan', ' data-v="col"') + btn('sort', '🔢 Nach Zahl', 'sm cyan', ' data-v="num"') +
       (canDisc && L.sel >= 0 && rack[L.sel] !== null ? btn('disc', '⤵️ Abwerfen', 'sm') + btn('fin', '🏁 Fertig!', 'sm lime') : '') + '</div>';
     if (done) h += '<div class="center" style="margin-top:12px">' + btn('rematch', '🔁 Nochmal spielen', 'lime') + '</div>';
@@ -2757,9 +2849,17 @@ function OnlineGame(host, gid) {
   async function create(invite, max) {
     const id = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), now = Date.now();
     const d = { game: gid, status: 'open', host: S.uid, players: [S.uid], max: gid === 'okey' ? (max || L.newMax) : 2, invite: invite || '', createdAt: now, updatedAt: now, turn: 0, winner: '', endBy: '', st: {}, msg: '' };
-    if (await w(() => mref(id).set(d))) { L.mid = id; L.wait = Date.now() + 6000; paint(); toast(invite ? '📨 Einladung an ' + uname(invite) + ' gesendet' : '🎮 Spiel erstellt – warte auf Mitspieler'); }
+    if (await w(() => mref(id).set(d))) { if (invite) sendPush([invite], { title: '📨 ' + myName() + ' lädt dich ein', body: g.name + ' – spielst du mit?', url: '#game=' + gid + ':' + id, tag: 'game-' + id }); L.mid = id; L.wait = Date.now() + 6000; paint(); toast(invite ? '📨 Einladung an ' + uname(invite) + ' gesendet' : '🎮 Spiel erstellt – warte auf Mitspieler'); }
   }
-  const T = async fn => { try { return await mref(L.mid).tx(fn); } catch (e) { fail(e); return null; } };
+  function gpush(b, r, id) {
+    if (!r || !r.players) return;
+    const gn = GAMES[r.game] ? GAMES[r.game].name : 'Spiel', others = r.players.filter(u => u !== S.uid), url = '#game=' + r.game + ':' + id, tag = 'game-' + id;
+    if (r.status === 'done' && (!b || b.status !== 'done')) return sendPush(others, { title: '🏁 ' + gn + ' ist vorbei', body: r.winner === S.uid ? myName() + ' hat gewonnen 🏆' : r.winner ? (r.winner === S.uid ? '' : uname(r.winner) + ' hat gewonnen 🏆') : (r.msg || 'Spiel beendet'), url, tag });
+    if (r.status === 'open' && b && r.players.length > b.players.length) return sendPush(others, { title: '🎮 ' + myName() + ' spielt mit!', body: gn + ': ' + r.players.length + '/' + r.max + ' Spieler', url, tag });
+    if (r.status === 'setup' && (!b || b.status !== 'setup')) return sendPush(others, { title: '🚢 ' + myName() + ' spielt mit!', body: 'Platziere deine Schiffe – los geht’s!', url, tag });
+    if (r.status === 'play') { const t = r.players[r.turn]; if (t !== S.uid && (!b || b.status !== 'play' || b.turn !== r.turn)) sendPush([t], { title: '🎲 Du bist dran!', body: gn + ' · ' + myName() + ' hat gezogen', url, tag }); }
+  }
+  const T = async fn => { const id = L.mid, b0 = match(), b = b0 ? JSON.parse(JSON.stringify(b0)) : null; try { const r = await mref(id).tx(fn); if (r) gpush(b, r, id); return r; } catch (e) { fail(e); return null; } };
   async function act(d) {
     const op = d.op, m = match(), i = +d.i;
     switch (op) {
@@ -2911,6 +3011,7 @@ function vAppCfg() {
     '<div class="card"><b style="font:800 20px var(--fh)">🧩 Funktionen</b>' + tgl('features.comments', '💬 Kommentare', f.comments) + tgl('features.reactions', '😂 Emoji-Reaktionen', f.reactions) + tgl('features.news', '📰 News-Bereich', f.news) + tgl('features.video', '🎬 Video-Uploads', f.video) + tgl('features.games', '🎮 Spielspot', f.games) + tgl('features.pacman', '👻 Pac-Man', f.pacman) + tgl('features.snake', '🐍 Snake', f.snake) + tgl('features.runner', '🏃 Slap Runner', f.runner) + tgl('features.battleship', '🚢 Schiffe versenken (online)', f.battleship) + tgl('features.okey', '🀄 Okey (online)', f.okey) + '</div>' +
     '<div class="card"><b style="font:800 20px var(--fh)">📢 Texte & Limits</b><label class="lb">Ankündigung im Feed (leer = keine)</label><textarea class="inp" rows="2" data-cfg="announcement" maxlength="200">' + esc(c.announcement) + '</textarea>' +
     '<label class="lb">Maximale Post-Länge (Zeichen)</label><input class="inp" type="number" min="100" max="3000" step="100" data-cfg="maxLen" value="' + esc(c.maxLen) + '">' +
+    '<label class="lb">📲 Push-Server-Adresse (für Mitteilungen bei geschlossener App)</label><input class="inp" data-cfg="pushUrl" maxlength="200" placeholder="https://theslap-push.DEINNAME.workers.dev" value="' + esc(c.pushUrl || '') + '" autocapitalize="none" inputmode="url"><p class="muted" style="font-weight:700;font-size:13px;margin:6px 0 0">' + (c.pushUrl ? '✅ Eingerichtet. Testen: Konto → „Test-Mitteilung an mich“.' : 'Noch leer – Anleitung im Chat. Ohne Adresse gibt es Mitteilungen nur, solange TheSlap offen ist.') + '</p>' +
     '<label class="lb">Maximale Videogröße (MB)</label><input class="inp" type="number" min="5" max="50" step="5" data-cfg="maxVideoMb" value="' + esc(c.maxVideoMb || 25) + '"><p class="muted" style="font-weight:700;font-size:13px;margin:6px 0 0">Videos liegen in der kostenlosen Datenbank (ca. 1 GB Platz). Kleine Videos = mehr Platz für alle.</p></div>' +
     '<div class="card"><b style="font:800 20px var(--fh)">🏆 Highscores zurücksetzen</b><div class="row wrap" style="margin-top:8px">' + Object.entries(GAMES).map(([id, g]) => '<button class="btn sm danger" data-a="resetscores" data-id="' + id + '">' + g.icon + ' ' + g.name + '</button>').join('') + '</div></div>';
 }
@@ -3164,7 +3265,7 @@ document.addEventListener('click', async e => {
     case 'zoom': zoom(t.dataset.src); break;
     case 'follow': toggleFollow(id); break;
     case 'delpost': if (await ask('Diesen Post wirklich löschen?', 'Löschen')) { closeSheet(); await w(() => deletePost(id)); toast('Post gelöscht'); } break;
-    case 'delcm': w(() => col('comments').doc(id).delete()); break;
+    case 'delcm': w(async () => { for (const c of S.comments.filter(c => c.replyTo === id)) await col('comments').doc(c.id).delete(); await col('comments').doc(id).delete(); }); break;
     case 'sendcm': sendComment(); break;
     case 'closesheet': closeSheet(); break;
     case 'yes': { const r = S.askRes; S.askRes = null; closeSheet(); if (r) r(true); break; }
@@ -3172,7 +3273,10 @@ document.addEventListener('click', async e => {
     case 'mood': { const i = +t.dataset.i; S.C.mood = S.C.mood === i ? null : i; $$('.mchip').forEach((b, k) => b.classList.toggle('on', S.C.mood === k)); break; }
     case 'rmmedia': { const m = S.C.media.splice(+t.dataset.i, 1)[0]; if (m && m.m) deleteMedia(m.m).catch(() => {}); paintCMedia(); break; }
     case 'playvid': playVideo(t); break;
-    case 'notifon': if (typeof Notification !== 'undefined') Notification.requestPermission().then(() => { render(true); updateAppBadge(); }); break;
+    case 'notifon': if (typeof Notification !== 'undefined') Notification.requestPermission().then(async p => { if (p === 'granted') { await pushSubscribe(); SND.play('notify'); } render(true); updateAppBadge(); }); break;
+    case 'pushtest': { t.disabled = true; const ok = await pushSubscribe(); const n = ok ? await sendPush([S.uid], { title: '🔔 TheSlap', body: 'Test geklappt! So sehen deine Mitteilungen aus ✨', url: '', tag: 'test' }, true) : 0; t.disabled = false; toast(n > 0 ? '📲 Gesendet – gleich kommt die Mitteilung!' : n === -1 ? 'Push-Server nicht erreichbar – stimmt die Adresse?' : 'Das hat nicht geklappt – Mitteilungen erlaubt? (iPhone: App vom Home-Bildschirm öffnen)'); break; }
+    case 'replycm': startReply(id); break;
+    case 'replyx': S.reply = null; paintReply(); break;
     case 'access': openAccessSheet(id); break;
     case 'saveaccess': saveAccess(id); break;
     case 'genpw3': $('#ac-pw').value = genPw(); break;
@@ -3268,7 +3372,8 @@ async function boot() {
   try { [db, user, assets] = await Promise.all([C.use('db'), C.use('user'), C.use('assets')]); } catch (e) { console.error(e); return gate(e && e.code === 'permission-denied' ? 'Die Online-Datenbank ist noch nicht freigegeben (Firestore-Regeln).' : 'Die Online-Datenbank ist gerade nicht erreichbar.'); }
   if (!db) return gate('Die Datenbank ist gerade nicht erreichbar.');
   S.db = db; S.user = user; S.assets = assets;
-  if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').then(r => { swReg = r; }).catch(() => {});
+  if ('serviceWorker' in navigator && location.protocol !== 'file:') { navigator.serviceWorker.register('sw.js').then(r => { swReg = r; r.update && r.update().catch(() => {}); }).catch(() => {}); navigator.serviceWorker.addEventListener('message', e => { if (e.data && e.data.type === 'open' && S.uid) openDeep(e.data.url); }); }
+  if (/^#(post|game)=/.test(location.hash)) { S.deep = location.hash; try { history.replaceState(null, '', location.pathname + location.search); } catch (_) { /* egal */ } }
   S.isOwner = !!(user && user.isOwner && user.isOwner());
   S.readonly = !S.isOwner && !!(user && user.can && user.can('data.write') === false);
   subscribeCfg();
